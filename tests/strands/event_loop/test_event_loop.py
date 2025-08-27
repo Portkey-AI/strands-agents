@@ -6,10 +6,23 @@ import pytest
 
 import strands
 import strands.telemetry
-from strands.handlers.tool_handler import AgentToolHandler
+from strands.experimental.hooks import (
+    AfterModelInvocationEvent,
+    AfterToolInvocationEvent,
+    BeforeModelInvocationEvent,
+    BeforeToolInvocationEvent,
+)
+from strands.hooks import HookRegistry
 from strands.telemetry.metrics import EventLoopMetrics
+from strands.tools.executors import SequentialToolExecutor
 from strands.tools.registry import ToolRegistry
-from strands.types.exceptions import ContextWindowOverflowException, EventLoopException, ModelThrottledException
+from strands.types.exceptions import (
+    ContextWindowOverflowException,
+    EventLoopException,
+    MaxTokensReachedException,
+    ModelThrottledException,
+)
+from tests.fixtures.mock_hook_provider import MockHookProvider
 
 
 @pytest.fixture
@@ -34,18 +47,8 @@ def messages():
 
 
 @pytest.fixture
-def tool_config():
-    return {"tools": [{"toolSpec": {"name": "tool_for_testing"}}], "toolChoice": {"auto": {}}}
-
-
-@pytest.fixture
 def tool_registry():
     return ToolRegistry()
-
-
-@pytest.fixture
-def tool_handler(tool_registry):
-    return AgentToolHandler(tool_registry)
 
 
 @pytest.fixture
@@ -55,13 +58,35 @@ def thread_pool():
 
 @pytest.fixture
 def tool(tool_registry):
-    @strands.tools.tool
-    def tool_for_testing(random_string: str) -> str:
+    @strands.tool
+    def tool_for_testing(random_string: str):
         return random_string
 
     tool_registry.register_tool(tool_for_testing)
 
     return tool_for_testing
+
+
+@pytest.fixture
+def tool_times_2(tool_registry):
+    @strands.tools.tool
+    def multiply_by_2(x: int) -> int:
+        return x * 2
+
+    tool_registry.register_tool(multiply_by_2)
+
+    return multiply_by_2
+
+
+@pytest.fixture
+def tool_times_5(tool_registry):
+    @strands.tools.tool
+    def multiply_by_5(x: int) -> int:
+        return x * 5
+
+    tool_registry.register_tool(multiply_by_5)
+
+    return multiply_by_5
 
 
 @pytest.fixture
@@ -84,9 +109,41 @@ def tool_stream(tool):
 
 
 @pytest.fixture
-def agent():
-    mock = unittest.mock.Mock()
+def hook_registry():
+    return HookRegistry()
+
+
+@pytest.fixture
+def hook_provider(hook_registry):
+    provider = MockHookProvider(
+        event_types=[
+            BeforeToolInvocationEvent,
+            AfterToolInvocationEvent,
+            BeforeModelInvocationEvent,
+            AfterModelInvocationEvent,
+        ]
+    )
+    hook_registry.add_hook(provider)
+    return provider
+
+
+@pytest.fixture
+def tool_executor():
+    return SequentialToolExecutor()
+
+
+@pytest.fixture
+def agent(model, system_prompt, messages, tool_registry, thread_pool, hook_registry, tool_executor):
+    mock = unittest.mock.Mock(name="agent")
     mock.config.cache_points = []
+    mock.model = model
+    mock.system_prompt = system_prompt
+    mock.messages = messages
+    mock.tool_registry = tool_registry
+    mock.thread_pool = thread_pool
+    mock.event_loop_metrics = EventLoopMetrics()
+    mock.hooks = hook_registry
+    mock.tool_executor = tool_executor
 
     return mock
 
@@ -101,16 +158,12 @@ def mock_tracer():
 
 @pytest.mark.asyncio
 async def test_event_loop_cycle_text_response(
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     agenerator,
     alist,
 ):
-    model.converse.return_value = agenerator(
+    model.stream.return_value = agenerator(
         [
             {"contentBlockDelta": {"delta": {"text": "test text"}}},
             {"contentBlockStop": {}},
@@ -118,15 +171,8 @@ async def test_event_loop_cycle_text_response(
     )
 
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={},
+        agent=agent,
+        invocation_state={},
     )
     events = await alist(stream)
     tru_stop_reason, tru_message, _, tru_request_state = events[-1]["stop"]
@@ -141,16 +187,12 @@ async def test_event_loop_cycle_text_response(
 @pytest.mark.asyncio
 async def test_event_loop_cycle_text_response_throttling(
     mock_time,
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     agenerator,
     alist,
 ):
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         ModelThrottledException("ThrottlingException | ConverseStream"),
         agenerator(
             [
@@ -161,15 +203,8 @@ async def test_event_loop_cycle_text_response_throttling(
     ]
 
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={},
+        agent=agent,
+        invocation_state={},
     )
     events = await alist(stream)
     tru_stop_reason, tru_message, _, tru_request_state = events[-1]["stop"]
@@ -186,18 +221,14 @@ async def test_event_loop_cycle_text_response_throttling(
 @pytest.mark.asyncio
 async def test_event_loop_cycle_exponential_backoff(
     mock_time,
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     agenerator,
     alist,
 ):
     """Test that the exponential backoff works correctly with multiple retries."""
     # Set up the model to raise throttling exceptions multiple times before succeeding
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         ModelThrottledException("ThrottlingException | ConverseStream"),
         ModelThrottledException("ThrottlingException | ConverseStream"),
         ModelThrottledException("ThrottlingException | ConverseStream"),
@@ -210,15 +241,8 @@ async def test_event_loop_cycle_exponential_backoff(
     ]
 
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={},
+        agent=agent,
+        invocation_state={},
     )
     events = await alist(stream)
     tru_stop_reason, tru_message, _, tru_request_state = events[-1]["stop"]
@@ -237,15 +261,11 @@ async def test_event_loop_cycle_exponential_backoff(
 @pytest.mark.asyncio
 async def test_event_loop_cycle_text_response_throttling_exceeded(
     mock_time,
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     alist,
 ):
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         ModelThrottledException("ThrottlingException | ConverseStream"),
         ModelThrottledException("ThrottlingException | ConverseStream"),
         ModelThrottledException("ThrottlingException | ConverseStream"),
@@ -256,15 +276,8 @@ async def test_event_loop_cycle_text_response_throttling_exceeded(
 
     with pytest.raises(ModelThrottledException):
         stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=system_prompt,
-            messages=messages,
-            tool_config=tool_config,
-            tool_handler=tool_handler,
-            thread_pool=thread_pool,
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
+            agent=agent,
+            invocation_state={},
         )
         await alist(stream)
 
@@ -281,44 +294,34 @@ async def test_event_loop_cycle_text_response_throttling_exceeded(
 
 @pytest.mark.asyncio
 async def test_event_loop_cycle_text_response_error(
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     alist,
 ):
-    model.converse.side_effect = RuntimeError("Unhandled error")
+    model.stream.side_effect = RuntimeError("Unhandled error")
 
     with pytest.raises(RuntimeError):
         stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=system_prompt,
-            messages=messages,
-            tool_config=tool_config,
-            tool_handler=tool_handler,
-            thread_pool=thread_pool,
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
+            agent=agent,
+            invocation_state={},
         )
         await alist(stream)
 
 
+@patch("strands.event_loop.event_loop.recover_message_on_max_tokens_reached")
 @pytest.mark.asyncio
 async def test_event_loop_cycle_tool_result(
+    mock_recover_message,
+    agent,
     model,
     system_prompt,
     messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     tool_stream,
+    tool_registry,
     agenerator,
     alist,
 ):
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         agenerator(tool_stream),
         agenerator(
             [
@@ -329,15 +332,8 @@ async def test_event_loop_cycle_tool_result(
     ]
 
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={},
+        agent=agent,
+        invocation_state={},
     )
     events = await alist(stream)
     tru_stop_reason, tru_message, _, tru_request_state = events[-1]["stop"]
@@ -348,7 +344,10 @@ async def test_event_loop_cycle_tool_result(
 
     assert tru_stop_reason == exp_stop_reason and tru_message == exp_message and tru_request_state == exp_request_state
 
-    model.converse.assert_called_with(
+    # Verify that recover_message_on_max_tokens_reached was NOT called for tool_use stop reason
+    mock_recover_message.assert_not_called()
+
+    model.stream.assert_called_with(
         [
             {"role": "user", "content": [{"text": "Hello"}]},
             {
@@ -377,109 +376,58 @@ async def test_event_loop_cycle_tool_result(
             },
             {"role": "assistant", "content": [{"text": "test text"}]},
         ],
-        [{"name": "tool_for_testing"}],
+        tool_registry.get_all_tool_specs(),
         "p1",
     )
 
 
 @pytest.mark.asyncio
 async def test_event_loop_cycle_tool_result_error(
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     tool_stream,
     agenerator,
     alist,
 ):
-    model.converse.side_effect = [agenerator(tool_stream)]
+    model.stream.side_effect = [agenerator(tool_stream)]
 
     with pytest.raises(EventLoopException):
         stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=system_prompt,
-            messages=messages,
-            tool_config=tool_config,
-            tool_handler=tool_handler,
-            thread_pool=thread_pool,
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
+            agent=agent,
+            invocation_state={},
         )
         await alist(stream)
 
 
 @pytest.mark.asyncio
 async def test_event_loop_cycle_tool_result_no_tool_handler(
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    thread_pool,
     tool_stream,
     agenerator,
     alist,
 ):
-    model.converse.side_effect = [agenerator(tool_stream)]
+    model.stream.side_effect = [agenerator(tool_stream)]
+    # Set tool_handler to None for this test
+    agent.tool_handler = None
 
     with pytest.raises(EventLoopException):
         stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=system_prompt,
-            messages=messages,
-            tool_config=tool_config,
-            tool_handler=None,
-            thread_pool=thread_pool,
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
-        )
-        await alist(stream)
-
-
-@pytest.mark.asyncio
-async def test_event_loop_cycle_tool_result_no_tool_config(
-    model,
-    system_prompt,
-    messages,
-    tool_handler,
-    thread_pool,
-    tool_stream,
-    agenerator,
-    alist,
-):
-    model.converse.side_effect = [agenerator(tool_stream)]
-
-    with pytest.raises(EventLoopException):
-        stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=system_prompt,
-            messages=messages,
-            tool_config=None,
-            tool_handler=tool_handler,
-            thread_pool=thread_pool,
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
+            agent=agent,
+            invocation_state={},
         )
         await alist(stream)
 
 
 @pytest.mark.asyncio
 async def test_event_loop_cycle_stop(
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     tool,
     agenerator,
     alist,
 ):
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         agenerator(
             [
                 {
@@ -499,15 +447,8 @@ async def test_event_loop_cycle_stop(
     ]
 
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={"request_state": {"stop_event_loop": True}},
+        agent=agent,
+        invocation_state={"request_state": {"stop_event_loop": True}},
     )
     events = await alist(stream)
     tru_stop_reason, tru_message, _, tru_request_state = events[-1]["stop"]
@@ -532,16 +473,12 @@ async def test_event_loop_cycle_stop(
 
 @pytest.mark.asyncio
 async def test_cycle_exception(
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     tool_stream,
     agenerator,
 ):
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         agenerator(tool_stream),
         agenerator(tool_stream),
         agenerator(tool_stream),
@@ -553,15 +490,8 @@ async def test_cycle_exception(
 
     with pytest.raises(EventLoopException):
         stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=system_prompt,
-            messages=messages,
-            tool_config=tool_config,
-            tool_handler=tool_handler,
-            thread_pool=thread_pool,
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
+            agent=agent,
+            invocation_state={},
         )
         async for event in stream:
             tru_stop_event = event
@@ -573,12 +503,8 @@ async def test_cycle_exception(
 @pytest.mark.asyncio
 async def test_event_loop_cycle_creates_spans(
     mock_get_tracer,
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     mock_tracer,
     agenerator,
     alist,
@@ -590,7 +516,7 @@ async def test_event_loop_cycle_creates_spans(
     model_span = MagicMock()
     mock_tracer.start_model_invoke_span.return_value = model_span
 
-    model.converse.return_value = agenerator(
+    model.stream.return_value = agenerator(
         [
             {"contentBlockDelta": {"delta": {"text": "test text"}}},
             {"contentBlockStop": {}},
@@ -599,15 +525,8 @@ async def test_event_loop_cycle_creates_spans(
 
     # Call event_loop_cycle
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={},
+        agent=agent,
+        invocation_state={},
     )
     await alist(stream)
 
@@ -623,12 +542,8 @@ async def test_event_loop_cycle_creates_spans(
 @pytest.mark.asyncio
 async def test_event_loop_tracing_with_model_error(
     mock_get_tracer,
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     mock_tracer,
     alist,
 ):
@@ -640,37 +555,73 @@ async def test_event_loop_tracing_with_model_error(
     mock_tracer.start_model_invoke_span.return_value = model_span
 
     # Set up model to raise an exception
-    model.converse.side_effect = ContextWindowOverflowException("Input too long")
+    model.stream.side_effect = ContextWindowOverflowException("Input too long")
 
     # Call event_loop_cycle, expecting it to handle the exception
     with pytest.raises(ContextWindowOverflowException):
         stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=system_prompt,
-            messages=messages,
-            tool_config=tool_config,
-            tool_handler=tool_handler,
-            thread_pool=thread_pool,
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
+            agent=agent,
+            invocation_state={},
         )
         await alist(stream)
 
     # Verify error handling span methods were called
-    mock_tracer.end_span_with_error.assert_called_once_with(model_span, "Input too long", model.converse.side_effect)
+    mock_tracer.end_span_with_error.assert_called_once_with(model_span, "Input too long", model.stream.side_effect)
+
+
+@pytest.mark.asyncio
+async def test_event_loop_cycle_max_tokens_exception(
+    agent,
+    model,
+    agenerator,
+    alist,
+):
+    """Test that max_tokens stop reason calls _recover_message_on_max_tokens_reached then MaxTokensReachedException."""
+
+    model.stream.side_effect = [
+        agenerator(
+            [
+                {
+                    "contentBlockStart": {
+                        "start": {
+                            "toolUse": {
+                                "toolUseId": "t1",
+                                "name": "asdf",
+                                "input": {},  # empty
+                            },
+                        },
+                    },
+                },
+                {"contentBlockStop": {}},
+                {"messageStop": {"stopReason": "max_tokens"}},
+            ]
+        ),
+    ]
+
+    # Call event_loop_cycle, expecting it to raise MaxTokensReachedException
+    expected_message = (
+        "Agent has reached an unrecoverable state due to max_tokens limit. "
+        "For more information see: "
+        "https://strandsagents.com/latest/user-guide/concepts/agents/agent-loop/#maxtokensreachedexception"
+    )
+    with pytest.raises(MaxTokensReachedException, match=expected_message):
+        stream = strands.event_loop.event_loop.event_loop_cycle(
+            agent=agent,
+            invocation_state={},
+        )
+        await alist(stream)
+
+    # Verify the exception message contains the expected content
+    assert len(agent.messages) == 2
+    assert "tool use was incomplete due" in agent.messages[1]["content"][0]["text"]
 
 
 @patch("strands.event_loop.event_loop.get_tracer")
 @pytest.mark.asyncio
 async def test_event_loop_tracing_with_tool_execution(
     mock_get_tracer,
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     tool_stream,
     mock_tracer,
     agenerator,
@@ -684,7 +635,7 @@ async def test_event_loop_tracing_with_tool_execution(
     mock_tracer.start_model_invoke_span.return_value = model_span
 
     # Set up model to return tool use and then text response
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         agenerator(tool_stream),
         agenerator(
             [
@@ -696,15 +647,8 @@ async def test_event_loop_tracing_with_tool_execution(
 
     # Call event_loop_cycle which should execute a tool
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={},
+        agent=agent,
+        invocation_state={},
     )
     await alist(stream)
 
@@ -718,12 +662,8 @@ async def test_event_loop_tracing_with_tool_execution(
 @pytest.mark.asyncio
 async def test_event_loop_tracing_with_throttling_exception(
     mock_get_tracer,
+    agent,
     model,
-    system_prompt,
-    messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     mock_tracer,
     agenerator,
     alist,
@@ -736,7 +676,7 @@ async def test_event_loop_tracing_with_throttling_exception(
     mock_tracer.start_model_invoke_span.return_value = model_span
 
     # Set up model to raise a throttling exception and then succeed
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         ModelThrottledException("Throttling Error"),
         agenerator(
             [
@@ -749,15 +689,8 @@ async def test_event_loop_tracing_with_throttling_exception(
     # Mock the time.sleep function to speed up the test
     with patch("strands.event_loop.event_loop.time.sleep"):
         stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=system_prompt,
-            messages=messages,
-            tool_config=tool_config,
-            tool_handler=tool_handler,
-            thread_pool=thread_pool,
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
+            agent=agent,
+            invocation_state={},
         )
         await alist(stream)
 
@@ -772,12 +705,9 @@ async def test_event_loop_tracing_with_throttling_exception(
 @pytest.mark.asyncio
 async def test_event_loop_cycle_with_parent_span(
     mock_get_tracer,
+    agent,
     model,
-    system_prompt,
     messages,
-    tool_config,
-    tool_handler,
-    thread_pool,
     mock_tracer,
     agenerator,
     alist,
@@ -788,46 +718,39 @@ async def test_event_loop_cycle_with_parent_span(
     cycle_span = MagicMock()
     mock_tracer.start_event_loop_cycle_span.return_value = cycle_span
 
-    model.converse.return_value = agenerator(
+    model.stream.return_value = agenerator(
         [
             {"contentBlockDelta": {"delta": {"text": "test text"}}},
             {"contentBlockStop": {}},
         ]
     )
 
+    # Set the parent span for this test
+    agent.trace_span = parent_span
+
     # Call event_loop_cycle with a parent span
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=parent_span,
-        kwargs={},
+        agent=agent,
+        invocation_state={},
     )
     await alist(stream)
 
     # Verify parent_span was used when creating cycle span
     mock_tracer.start_event_loop_cycle_span.assert_called_once_with(
-        event_loop_kwargs=unittest.mock.ANY, parent_span=parent_span, messages=messages
+        invocation_state=unittest.mock.ANY, parent_span=parent_span, messages=messages
     )
 
 
 @pytest.mark.asyncio
 async def test_request_state_initialization(alist):
+    # Create a mock agent
+    mock_agent = MagicMock()
+    mock_agent.event_loop_metrics.start_cycle.return_value = (0, MagicMock())
+
     # Call without providing request_state
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=MagicMock(),
-        system_prompt=MagicMock(),
-        messages=MagicMock(),
-        tool_config=MagicMock(),
-        tool_handler=MagicMock(),
-        thread_pool=MagicMock(),
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={},
+        agent=mock_agent,
+        invocation_state={},
     )
     events = await alist(stream)
     _, _, _, tru_request_state = events[-1]["stop"]
@@ -838,15 +761,8 @@ async def test_request_state_initialization(alist):
     # Call with pre-existing request_state
     initial_request_state = {"key": "value"}
     stream = strands.event_loop.event_loop.event_loop_cycle(
-        model=MagicMock(),
-        system_prompt=MagicMock(),
-        messages=MagicMock(),
-        tool_config=MagicMock(),
-        tool_handler=MagicMock(),
-        thread_pool=MagicMock(),
-        event_loop_metrics=EventLoopMetrics(),
-        event_loop_parent_span=None,
-        kwargs={"request_state": initial_request_state},
+        agent=mock_agent,
+        invocation_state={"request_state": initial_request_state},
     )
     events = await alist(stream)
     _, _, _, tru_request_state = events[-1]["stop"]
@@ -856,9 +772,9 @@ async def test_request_state_initialization(alist):
 
 
 @pytest.mark.asyncio
-async def test_prepare_next_cycle_in_tool_execution(model, tool_stream, agenerator, alist):
+async def test_prepare_next_cycle_in_tool_execution(agent, model, tool_stream, agenerator, alist):
     """Test that cycle ID and metrics are properly updated during tool execution."""
-    model.converse.side_effect = [
+    model.stream.side_effect = [
         agenerator(tool_stream),
         agenerator(
             [
@@ -867,7 +783,7 @@ async def test_prepare_next_cycle_in_tool_execution(model, tool_stream, agenerat
         ),
     ]
 
-    # Create a mock for recurse_event_loop to capture the kwargs passed to it
+    # Create a mock for recurse_event_loop to capture the invocation_state passed to it
     with unittest.mock.patch.object(strands.event_loop.event_loop, "recurse_event_loop") as mock_recurse:
         # Set up mock to return a valid response
         mock_recurse.return_value = agenerator(
@@ -883,15 +799,8 @@ async def test_prepare_next_cycle_in_tool_execution(model, tool_stream, agenerat
 
         # Call event_loop_cycle which should execute a tool and then call recurse_event_loop
         stream = strands.event_loop.event_loop.event_loop_cycle(
-            model=model,
-            system_prompt=MagicMock(),
-            messages=MagicMock(),
-            tool_config=MagicMock(),
-            tool_handler=MagicMock(),
-            thread_pool=MagicMock(),
-            event_loop_metrics=EventLoopMetrics(),
-            event_loop_parent_span=None,
-            kwargs={},
+            agent=agent,
+            invocation_state={},
         )
         await alist(stream)
 
@@ -899,5 +808,58 @@ async def test_prepare_next_cycle_in_tool_execution(model, tool_stream, agenerat
 
         # Verify required properties are present
         recursive_args = mock_recurse.call_args[1]
-        assert "event_loop_parent_cycle_id" in recursive_args["kwargs"]
-        assert recursive_args["kwargs"]["event_loop_parent_cycle_id"] == recursive_args["kwargs"]["event_loop_cycle_id"]
+        assert "event_loop_parent_cycle_id" in recursive_args["invocation_state"]
+        assert (
+            recursive_args["invocation_state"]["event_loop_parent_cycle_id"]
+            == recursive_args["invocation_state"]["event_loop_cycle_id"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_event_loop_cycle_exception_model_hooks(mock_time, agent, model, agenerator, alist, hook_provider):
+    """Test that model hooks are correctly emitted even when throttled."""
+    # Set up the model to raise throttling exceptions multiple times before succeeding
+    exception = ModelThrottledException("ThrottlingException | ConverseStream")
+    model.stream.side_effect = [
+        exception,
+        exception,
+        exception,
+        agenerator(
+            [
+                {"contentBlockDelta": {"delta": {"text": "test text"}}},
+                {"contentBlockStop": {}},
+            ]
+        ),
+    ]
+
+    stream = strands.event_loop.event_loop.event_loop_cycle(
+        agent=agent,
+        invocation_state={},
+    )
+    await alist(stream)
+
+    count, events = hook_provider.get_events()
+
+    assert count == 8
+
+    # 1st call - throttled
+    assert next(events) == BeforeModelInvocationEvent(agent=agent)
+    assert next(events) == AfterModelInvocationEvent(agent=agent, stop_response=None, exception=exception)
+
+    # 2nd call - throttled
+    assert next(events) == BeforeModelInvocationEvent(agent=agent)
+    assert next(events) == AfterModelInvocationEvent(agent=agent, stop_response=None, exception=exception)
+
+    # 3rd call - throttled
+    assert next(events) == BeforeModelInvocationEvent(agent=agent)
+    assert next(events) == AfterModelInvocationEvent(agent=agent, stop_response=None, exception=exception)
+
+    # 4th call - successful
+    assert next(events) == BeforeModelInvocationEvent(agent=agent)
+    assert next(events) == AfterModelInvocationEvent(
+        agent=agent,
+        stop_response=AfterModelInvocationEvent.ModelStopResponse(
+            message={"content": [{"text": "test text"}], "role": "assistant"}, stop_reason="end_turn"
+        ),
+        exception=None,
+    )

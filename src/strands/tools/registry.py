@@ -11,13 +11,13 @@ import sys
 from importlib import import_module, util
 from os.path import expanduser
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from typing_extensions import TypedDict, cast
 
 from strands.tools.decorator import DecoratedFunctionTool
 
-from ..types.tools import AgentTool, Tool, ToolChoice, ToolChoiceAuto, ToolConfig, ToolSpec
+from ..types.tools import AgentTool, ToolSpec
 from .tools import PythonAgentTool, normalize_schema, normalize_tool_spec
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class ToolRegistry:
         """
         tool_names = []
 
-        for tool in tools:
+        def add_tool(tool: Any) -> None:
             # Case 1: String file path
             if isinstance(tool, str):
                 # Extract tool name from path
@@ -97,8 +97,15 @@ class ToolRegistry:
             elif isinstance(tool, AgentTool):
                 self.register_tool(tool)
                 tool_names.append(tool.tool_name)
+            # Case 6: Nested iterable (list, tuple, etc.) - add each sub-tool
+            elif isinstance(tool, Iterable) and not isinstance(tool, (str, bytes, bytearray)):
+                for t in tool:
+                    add_tool(t)
             else:
                 logger.warning("tool=<%s> | unrecognized tool specification", tool)
+
+        for a_tool in tools:
+            add_tool(a_tool)
 
         return tool_names
 
@@ -347,11 +354,7 @@ class ToolRegistry:
             # Validate tool spec
             self.validate_tool_spec(module.TOOL_SPEC)
 
-            new_tool = PythonAgentTool(
-                tool_name=tool_name,
-                tool_spec=module.TOOL_SPEC,
-                callback=tool_function,
-            )
+            new_tool = PythonAgentTool(tool_name, module.TOOL_SPEC, tool_function)
 
             # Register the tool
             self.register_tool(new_tool)
@@ -365,7 +368,7 @@ class ToolRegistry:
             logger.exception("tool_name=<%s> | failed to reload tool", tool_name)
             raise
 
-    def initialize_tools(self, load_tools_from_directory: bool = True) -> None:
+    def initialize_tools(self, load_tools_from_directory: bool = False) -> None:
         """Initialize all tools by discovering and loading them dynamically from all tool directories.
 
         Args:
@@ -431,11 +434,7 @@ class ToolRegistry:
                                     continue
 
                                 tool_spec = module.TOOL_SPEC
-                                tool = PythonAgentTool(
-                                    tool_name=tool_name,
-                                    tool_spec=tool_spec,
-                                    callback=tool_function,
-                                )
+                                tool = PythonAgentTool(tool_name, tool_spec, tool_function)
                                 self.register_tool(tool)
                                 successful_loads += 1
 
@@ -463,11 +462,7 @@ class ToolRegistry:
                                 continue
 
                             tool_spec = module.TOOL_SPEC
-                            tool = PythonAgentTool(
-                                tool_name=tool_name,
-                                tool_spec=tool_spec,
-                                callback=tool_function,
-                            )
+                            tool = PythonAgentTool(tool_name, tool_spec, tool_function)
                             self.register_tool(tool)
                             successful_loads += 1
 
@@ -484,20 +479,15 @@ class ToolRegistry:
             for tool_name, error in tool_import_errors.items():
                 logger.debug("tool_name=<%s> | import error | %s", tool_name, error)
 
-    def initialize_tool_config(self) -> ToolConfig:
-        """Initialize tool configuration from tool handler with optional filtering.
+    def get_all_tool_specs(self) -> list[ToolSpec]:
+        """Get all the tool specs for all tools in this registry..
 
         Returns:
-            Tool config.
+            A list of ToolSpecs.
         """
         all_tools = self.get_all_tools_config()
-
-        tools: List[Tool] = [{"toolSpec": tool_spec} for tool_spec in all_tools.values()]
-
-        return ToolConfig(
-            tools=tools,
-            toolChoice=cast(ToolChoice, {"auto": ToolChoiceAuto()}),
-        )
+        tools: List[ToolSpec] = [tool_spec for tool_spec in all_tools.values()]
+        return tools
 
     def validate_tool_spec(self, tool_spec: ToolSpec) -> None:
         """Validate tool specification against required schema.

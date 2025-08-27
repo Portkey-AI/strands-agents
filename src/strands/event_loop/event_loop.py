@@ -11,22 +11,34 @@ The event loop allows agents to:
 import logging
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator
 
-from opentelemetry import trace
+from opentelemetry import trace as trace_api
 
-from ..telemetry.metrics import EventLoopMetrics, Trace
+from ..experimental.hooks import (
+    AfterModelInvocationEvent,
+    BeforeModelInvocationEvent,
+)
+from ..hooks import (
+    MessageAddedEvent,
+)
+from ..telemetry.metrics import Trace
 from ..telemetry.tracer import get_tracer
-from ..tools.executor import run_tools, validate_and_prepare_tools
-from ..types.content import Message, Messages
-from ..types.exceptions import ContextWindowOverflowException, EventLoopException, ModelThrottledException
-from ..types.models import Model
+from ..tools._validator import validate_and_prepare_tools
+from ..types.content import Message
+from ..types.exceptions import (
+    ContextWindowOverflowException,
+    EventLoopException,
+    MaxTokensReachedException,
+    ModelThrottledException,
+)
 from ..types.streaming import Metrics, StopReason
-from ..types.tools import ToolConfig, ToolHandler, ToolResult, ToolUse
-from .message_processor import clean_orphaned_empty_tool_uses
+from ..types.tools import ToolResult, ToolUse
+from ._recover_message_on_max_tokens_reached import recover_message_on_max_tokens_reached
 from .streaming import stream_messages
+
+if TYPE_CHECKING:
+    from ..agent import Agent
 
 logger = logging.getLogger(__name__)
 
@@ -35,17 +47,7 @@ INITIAL_DELAY = 4
 MAX_DELAY = 240  # 4 minutes
 
 
-async def event_loop_cycle(
-    model: Model,
-    system_prompt: Optional[str],
-    messages: Messages,
-    tool_config: Optional[ToolConfig],
-    tool_handler: Optional[ToolHandler],
-    thread_pool: Optional[ThreadPoolExecutor],
-    event_loop_metrics: EventLoopMetrics,
-    event_loop_parent_span: Optional[trace.Span],
-    kwargs: dict[str, Any],
-) -> AsyncGenerator[dict[str, Any], None]:
+async def event_loop_cycle(agent: "Agent", invocation_state: dict[str, Any]) -> AsyncGenerator[dict[str, Any], None]:
     """Execute a single cycle of the event loop.
 
     This core function processes a single conversation turn, handling model inference, tool execution, and error
@@ -60,22 +62,15 @@ async def event_loop_cycle(
     7. Error handling and recovery
 
     Args:
-        model: Provider for running model inference.
-        system_prompt: System prompt instructions for the model.
-        messages: Conversation history messages.
-        tool_config: Configuration for available tools.
-        tool_handler: Handler for executing tools.
-        thread_pool: Optional thread pool for parallel tool execution.
-        event_loop_metrics: Metrics tracking object for the event loop.
-        event_loop_parent_span: Span for the parent of this event loop.
-        kwargs: Additional arguments including:
+        agent: The agent for which the cycle is being executed.
+        invocation_state: Additional arguments including:
 
             - request_state: State maintained across cycles
             - event_loop_cycle_id: Unique ID for this cycle
             - event_loop_cycle_span: Current tracing Span for this cycle
 
     Yields:
-        Model and tool invocation events. The last event is a tuple containing:
+        Model and tool stream events. The last event is a tuple containing:
 
             - StopReason: Reason the model stopped generating (e.g., "tool_use")
             - Message: The generated message from the model
@@ -87,14 +82,14 @@ async def event_loop_cycle(
         ContextWindowOverflowException: If the input is too large for the model
     """
     # Initialize cycle state
-    kwargs["event_loop_cycle_id"] = uuid.uuid4()
+    invocation_state["event_loop_cycle_id"] = uuid.uuid4()
 
     # Initialize state and get cycle trace
-    if "request_state" not in kwargs:
-        kwargs["request_state"] = {}
-    attributes = {"event_loop_cycle_id": str(kwargs.get("event_loop_cycle_id"))}
-    cycle_start_time, cycle_trace = event_loop_metrics.start_cycle(attributes=attributes)
-    kwargs["event_loop_cycle_trace"] = cycle_trace
+    if "request_state" not in invocation_state:
+        invocation_state["request_state"] = {}
+    attributes = {"event_loop_cycle_id": str(invocation_state.get("event_loop_cycle_id"))}
+    cycle_start_time, cycle_trace = agent.event_loop_metrics.start_cycle(attributes=attributes)
+    invocation_state["event_loop_cycle_trace"] = cycle_trace
 
     yield {"callback": {"start": True}}
     yield {"callback": {"start_event_loop": True}}
@@ -102,16 +97,13 @@ async def event_loop_cycle(
     # Create tracer span for this event loop cycle
     tracer = get_tracer()
     cycle_span = tracer.start_event_loop_cycle_span(
-        event_loop_kwargs=kwargs, messages=messages, parent_span=event_loop_parent_span
+        invocation_state=invocation_state, messages=agent.messages, parent_span=agent.trace_span
     )
-    kwargs["event_loop_cycle_span"] = cycle_span
+    invocation_state["event_loop_cycle_span"] = cycle_span
 
     # Create a trace for the stream_messages call
     stream_trace = Trace("stream_messages", parent_id=cycle_trace.id)
     cycle_trace.add_child(stream_trace)
-
-    # Clean up orphaned empty tool uses
-    clean_orphaned_empty_tool_uses(messages)
 
     # Process messages with exponential backoff for throttling
     message: Message
@@ -122,57 +114,84 @@ async def event_loop_cycle(
     # Retry loop for handling throttling exceptions
     current_delay = INITIAL_DELAY
     for attempt in range(MAX_ATTEMPTS):
-        model_id = model.config.get("model_id") if hasattr(model, "config") else None
+        model_id = agent.model.config.get("model_id") if hasattr(agent.model, "config") else None
         model_invoke_span = tracer.start_model_invoke_span(
-            messages=messages,
+            messages=agent.messages,
             parent_span=cycle_span,
             model_id=model_id,
         )
+        with trace_api.use_span(model_invoke_span):
+            tool_specs = agent.tool_registry.get_all_tool_specs()
 
-        try:
-            # TODO: To maintain backwards compatability, we need to combine the stream event with kwargs before yielding
-            #       to the callback handler. This will be revisited when migrating to strongly typed events.
-            async for event in stream_messages(model, system_prompt, messages, tool_config):
-                if "callback" in event:
-                    yield {"callback": {**event["callback"], **(kwargs if "delta" in event["callback"] else {})}}
-
-            stop_reason, message, usage, metrics = event["stop"]
-            kwargs.setdefault("request_state", {})
-
-            if model_invoke_span:
-                tracer.end_model_invoke_span(model_invoke_span, message, usage, stop_reason)
-            break  # Success! Break out of retry loop
-
-        except ContextWindowOverflowException as e:
-            if model_invoke_span:
-                tracer.end_span_with_error(model_invoke_span, str(e), e)
-            raise e
-
-        except ModelThrottledException as e:
-            if model_invoke_span:
-                tracer.end_span_with_error(model_invoke_span, str(e), e)
-
-            if attempt + 1 == MAX_ATTEMPTS:
-                yield {"callback": {"force_stop": True, "force_stop_reason": str(e)}}
-                raise e
-
-            logger.debug(
-                "retry_delay_seconds=<%s>, max_attempts=<%s>, current_attempt=<%s> "
-                "| throttling exception encountered "
-                "| delaying before next retry",
-                current_delay,
-                MAX_ATTEMPTS,
-                attempt + 1,
+            agent.hooks.invoke_callbacks(
+                BeforeModelInvocationEvent(
+                    agent=agent,
+                )
             )
-            time.sleep(current_delay)
-            current_delay = min(current_delay * 2, MAX_DELAY)
 
-            yield {"callback": {"event_loop_throttled_delay": current_delay, **kwargs}}
+            try:
+                # TODO: To maintain backwards compatibility, we need to combine the stream event with invocation_state
+                #       before yielding to the callback handler. This will be revisited when migrating to strongly
+                #       typed events.
+                async for event in stream_messages(agent.model, agent.system_prompt, agent.messages, tool_specs):
+                    if "callback" in event:
+                        yield {
+                            "callback": {
+                                **event["callback"],
+                                **(invocation_state if "delta" in event["callback"] else {}),
+                            }
+                        }
 
-        except Exception as e:
-            if model_invoke_span:
-                tracer.end_span_with_error(model_invoke_span, str(e), e)
-            raise e
+                stop_reason, message, usage, metrics = event["stop"]
+                invocation_state.setdefault("request_state", {})
+
+                agent.hooks.invoke_callbacks(
+                    AfterModelInvocationEvent(
+                        agent=agent,
+                        stop_response=AfterModelInvocationEvent.ModelStopResponse(
+                            stop_reason=stop_reason,
+                            message=message,
+                        ),
+                    )
+                )
+
+                if stop_reason == "max_tokens":
+                    message = recover_message_on_max_tokens_reached(message)
+
+                if model_invoke_span:
+                    tracer.end_model_invoke_span(model_invoke_span, message, usage, stop_reason)
+                break  # Success! Break out of retry loop
+
+            except Exception as e:
+                if model_invoke_span:
+                    tracer.end_span_with_error(model_invoke_span, str(e), e)
+
+                agent.hooks.invoke_callbacks(
+                    AfterModelInvocationEvent(
+                        agent=agent,
+                        exception=e,
+                    )
+                )
+
+                if isinstance(e, ModelThrottledException):
+                    if attempt + 1 == MAX_ATTEMPTS:
+                        yield {"callback": {"force_stop": True, "force_stop_reason": str(e)}}
+                        raise e
+
+                    logger.debug(
+                        "retry_delay_seconds=<%s>, max_attempts=<%s>, current_attempt=<%s> "
+                        "| throttling exception encountered "
+                        "| delaying before next retry",
+                        current_delay,
+                        MAX_ATTEMPTS,
+                        attempt + 1,
+                    )
+                    time.sleep(current_delay)
+                    current_delay = min(current_delay * 2, MAX_DELAY)
+
+                    yield {"callback": {"event_loop_throttled_delay": current_delay, **invocation_state}}
+                else:
+                    raise e
 
     try:
         # Add message in trace and mark the end of the stream messages trace
@@ -180,43 +199,41 @@ async def event_loop_cycle(
         stream_trace.end()
 
         # Add the response message to the conversation
-        messages.append(message)
+        agent.messages.append(message)
+        agent.hooks.invoke_callbacks(MessageAddedEvent(agent=agent, message=message))
         yield {"callback": {"message": message}}
 
         # Update metrics
-        event_loop_metrics.update_usage(usage)
-        event_loop_metrics.update_metrics(metrics)
+        agent.event_loop_metrics.update_usage(usage)
+        agent.event_loop_metrics.update_metrics(metrics)
+
+        if stop_reason == "max_tokens":
+            """
+            Handle max_tokens limit reached by the model.
+
+            When the model reaches its maximum token limit, this represents a potentially unrecoverable
+            state where the model's response was truncated. By default, Strands fails hard with an
+            MaxTokensReachedException to maintain consistency with other failure types.
+            """
+            raise MaxTokensReachedException(
+                message=(
+                    "Agent has reached an unrecoverable state due to max_tokens limit. "
+                    "For more information see: "
+                    "https://strandsagents.com/latest/user-guide/concepts/agents/agent-loop/#maxtokensreachedexception"
+                )
+            )
 
         # If the model is requesting to use tools
         if stop_reason == "tool_use":
-            if not tool_handler:
-                raise EventLoopException(
-                    Exception("Model requested tool use but no tool handler provided"),
-                    kwargs["request_state"],
-                )
-
-            if tool_config is None:
-                raise EventLoopException(
-                    Exception("Model requested tool use but no tool config provided"),
-                    kwargs["request_state"],
-                )
-
             # Handle tool execution
             events = _handle_tool_execution(
                 stop_reason,
                 message,
-                model,
-                system_prompt,
-                messages,
-                tool_config,
-                tool_handler,
-                thread_pool,
-                event_loop_metrics,
-                event_loop_parent_span,
-                cycle_trace,
-                cycle_span,
-                cycle_start_time,
-                kwargs,
+                agent=agent,
+                cycle_trace=cycle_trace,
+                cycle_span=cycle_span,
+                cycle_start_time=cycle_start_time,
+                invocation_state=invocation_state,
             )
             async for event in events:
                 yield event
@@ -224,7 +241,7 @@ async def event_loop_cycle(
             return
 
         # End the cycle and return results
-        event_loop_metrics.end_cycle(cycle_start_time, cycle_trace, attributes)
+        agent.event_loop_metrics.end_cycle(cycle_start_time, cycle_trace, attributes)
         if cycle_span:
             tracer.end_event_loop_cycle_span(
                 span=cycle_span,
@@ -237,7 +254,8 @@ async def event_loop_cycle(
         # Don't yield or log the exception - we already did it when we
         # raised the exception and we don't need that duplication.
         raise
-    except ContextWindowOverflowException as e:
+    except (ContextWindowOverflowException, MaxTokensReachedException) as e:
+        # Special cased exceptions which we want to bubble up rather than get wrapped in an EventLoopException
         if cycle_span:
             tracer.end_span_with_error(cycle_span, str(e), e)
         raise e
@@ -248,36 +266,19 @@ async def event_loop_cycle(
         # Handle any other exceptions
         yield {"callback": {"force_stop": True, "force_stop_reason": str(e)}}
         logger.exception("cycle failed")
-        raise EventLoopException(e, kwargs["request_state"]) from e
+        raise EventLoopException(e, invocation_state["request_state"]) from e
 
-    yield {"stop": (stop_reason, message, event_loop_metrics, kwargs["request_state"])}
+    yield {"stop": (stop_reason, message, agent.event_loop_metrics, invocation_state["request_state"])}
 
 
-async def recurse_event_loop(
-    model: Model,
-    system_prompt: Optional[str],
-    messages: Messages,
-    tool_config: Optional[ToolConfig],
-    tool_handler: Optional[ToolHandler],
-    thread_pool: Optional[ThreadPoolExecutor],
-    event_loop_metrics: EventLoopMetrics,
-    event_loop_parent_span: Optional[trace.Span],
-    kwargs: dict[str, Any],
-) -> AsyncGenerator[dict[str, Any], None]:
+async def recurse_event_loop(agent: "Agent", invocation_state: dict[str, Any]) -> AsyncGenerator[dict[str, Any], None]:
     """Make a recursive call to event_loop_cycle with the current state.
 
     This function is used when the event loop needs to continue processing after tool execution.
 
     Args:
-        model: Provider for running model inference
-        system_prompt: System prompt instructions for the model
-        messages: Conversation history messages
-        tool_config: Configuration for available tools
-        tool_handler: Handler for tool execution
-        thread_pool: Optional thread pool for parallel tool execution.
-        event_loop_metrics: Metrics tracking object for the event loop.
-        event_loop_parent_span: Span for the parent of this event loop.
-        kwargs: Arguments to pass through event_loop_cycle
+        agent: Agent for which the recursive call is being made.
+        invocation_state: Arguments to pass through event_loop_cycle
 
 
     Yields:
@@ -288,7 +289,7 @@ async def recurse_event_loop(
             - EventLoopMetrics: Updated metrics for the event loop
             - Any: Updated request state
     """
-    cycle_trace = kwargs["event_loop_cycle_trace"]
+    cycle_trace = invocation_state["event_loop_cycle_trace"]
 
     # Recursive call trace
     recursive_trace = Trace("Recursive call", parent_id=cycle_trace.id)
@@ -296,17 +297,7 @@ async def recurse_event_loop(
 
     yield {"callback": {"start": True}}
 
-    events = event_loop_cycle(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=event_loop_metrics,
-        event_loop_parent_span=event_loop_parent_span,
-        kwargs=kwargs,
-    )
+    events = event_loop_cycle(agent=agent, invocation_state=invocation_state)
     async for event in events:
         yield event
 
@@ -316,108 +307,68 @@ async def recurse_event_loop(
 async def _handle_tool_execution(
     stop_reason: StopReason,
     message: Message,
-    model: Model,
-    system_prompt: Optional[str],
-    messages: Messages,
-    tool_config: ToolConfig,
-    tool_handler: ToolHandler,
-    thread_pool: Optional[ThreadPoolExecutor],
-    event_loop_metrics: EventLoopMetrics,
-    event_loop_parent_span: Optional[trace.Span],
+    agent: "Agent",
     cycle_trace: Trace,
     cycle_span: Any,
     cycle_start_time: float,
-    kwargs: dict[str, Any],
+    invocation_state: dict[str, Any],
 ) -> AsyncGenerator[dict[str, Any], None]:
-    tool_uses: list[ToolUse] = []
-    tool_results: list[ToolResult] = []
-    invalid_tool_use_ids: list[str] = []
-
-    """
-    Handles the execution of tools requested by the model during an event loop cycle.
+    """Handles the execution of tools requested by the model during an event loop cycle.
 
     Args:
         stop_reason: The reason the model stopped generating.
         message: The message from the model that may contain tool use requests.
-        model: The model provider instance.
-        system_prompt: The system prompt instructions for the model.
-        messages: The conversation history messages.
-        tool_config: Configuration for available tools.
-        tool_handler: Handler for tool execution.
-        thread_pool: Optional thread pool for parallel tool execution.
-        event_loop_metrics: Metrics tracking object for the event loop.
-        event_loop_parent_span: Span for the parent of this event loop.
+        agent: Agent for which tools are being executed.
         cycle_trace: Trace object for the current event loop cycle.
         cycle_span: Span object for tracing the cycle (type may vary).
         cycle_start_time: Start time of the current cycle.
-        kwargs: Additional keyword arguments, including request state.
+        invocation_state: Additional keyword arguments, including request state.
 
     Yields:
-        Tool invocation events along with events yielded from a recursive call to the event loop. The last event is a
-        tuple containing:
+        Tool stream events along with events yielded from a recursive call to the event loop. The last event is a tuple
+        containing:
             - The stop reason,
             - The updated message,
             - The updated event loop metrics,
             - The updated request state.
     """
-    validate_and_prepare_tools(message, tool_uses, tool_results, invalid_tool_use_ids)
+    tool_uses: list[ToolUse] = []
+    tool_results: list[ToolResult] = []
+    invalid_tool_use_ids: list[str] = []
 
+    validate_and_prepare_tools(message, tool_uses, tool_results, invalid_tool_use_ids)
+    tool_uses = [tool_use for tool_use in tool_uses if tool_use.get("toolUseId") not in invalid_tool_use_ids]
     if not tool_uses:
-        yield {"stop": (stop_reason, message, event_loop_metrics, kwargs["request_state"])}
+        yield {"stop": (stop_reason, message, agent.event_loop_metrics, invocation_state["request_state"])}
         return
 
-    tool_handler_process = partial(
-        tool_handler.process,
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        kwargs=kwargs,
+    tool_events = agent.tool_executor._execute(
+        agent, tool_uses, tool_results, cycle_trace, cycle_span, invocation_state
     )
-
-    tool_events = run_tools(
-        handler=tool_handler_process,
-        tool_uses=tool_uses,
-        event_loop_metrics=event_loop_metrics,
-        invalid_tool_use_ids=invalid_tool_use_ids,
-        tool_results=tool_results,
-        cycle_trace=cycle_trace,
-        parent_span=cycle_span,
-        thread_pool=thread_pool,
-    )
-    for tool_event in tool_events:
+    async for tool_event in tool_events:
         yield tool_event
 
     # Store parent cycle ID for the next cycle
-    kwargs["event_loop_parent_cycle_id"] = kwargs["event_loop_cycle_id"]
+    invocation_state["event_loop_parent_cycle_id"] = invocation_state["event_loop_cycle_id"]
 
     tool_result_message: Message = {
         "role": "user",
         "content": [{"toolResult": result} for result in tool_results],
     }
 
-    messages.append(tool_result_message)
+    agent.messages.append(tool_result_message)
+    agent.hooks.invoke_callbacks(MessageAddedEvent(agent=agent, message=tool_result_message))
     yield {"callback": {"message": tool_result_message}}
 
     if cycle_span:
         tracer = get_tracer()
         tracer.end_event_loop_cycle_span(span=cycle_span, message=message, tool_result_message=tool_result_message)
 
-    if kwargs["request_state"].get("stop_event_loop", False):
-        event_loop_metrics.end_cycle(cycle_start_time, cycle_trace)
-        yield {"stop": (stop_reason, message, event_loop_metrics, kwargs["request_state"])}
+    if invocation_state["request_state"].get("stop_event_loop", False):
+        agent.event_loop_metrics.end_cycle(cycle_start_time, cycle_trace)
+        yield {"stop": (stop_reason, message, agent.event_loop_metrics, invocation_state["request_state"])}
         return
 
-    events = recurse_event_loop(
-        model=model,
-        system_prompt=system_prompt,
-        messages=messages,
-        tool_config=tool_config,
-        tool_handler=tool_handler,
-        thread_pool=thread_pool,
-        event_loop_metrics=event_loop_metrics,
-        event_loop_parent_span=event_loop_parent_span,
-        kwargs=kwargs,
-    )
+    events = recurse_event_loop(agent=agent, invocation_state=invocation_state)
     async for event in events:
         yield event

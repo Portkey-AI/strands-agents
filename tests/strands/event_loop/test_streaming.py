@@ -26,6 +26,7 @@ def moto_autouse(moto_env, moto_mock_aws):
                 {"role": "assistant", "content": [{"text": "a"}, {"text": " \n"}, {"toolUse": {}}]},
                 {"role": "assistant", "content": [{"text": ""}, {"toolUse": {}}]},
                 {"role": "assistant", "content": [{"text": "a"}, {"text": " \n"}]},
+                {"role": "assistant", "content": []},
                 {"role": "assistant"},
                 {"role": "user", "content": [{"text": " \n"}]},
             ],
@@ -33,6 +34,7 @@ def moto_autouse(moto_env, moto_mock_aws):
                 {"role": "assistant", "content": [{"text": "a"}, {"toolUse": {}}]},
                 {"role": "assistant", "content": [{"toolUse": {}}]},
                 {"role": "assistant", "content": [{"text": "a"}, {"text": "[blank text]"}]},
+                {"role": "assistant", "content": [{"text": "[blank text]"}]},
                 {"role": "assistant"},
                 {"role": "user", "content": [{"text": " \n"}]},
             ],
@@ -216,6 +218,21 @@ def test_handle_content_block_delta(event: ContentBlockDeltaEvent, state, exp_up
                 "signature": "123",
             },
         ),
+        # Reasoning without signature
+        (
+            {
+                "content": [],
+                "current_tool_use": {},
+                "text": "",
+                "reasoningText": "test",
+            },
+            {
+                "content": [{"reasoningContent": {"reasoningText": {"text": "test"}}}],
+                "current_tool_use": {},
+                "text": "",
+                "reasoningText": "",
+            },
+        ),
         # Empty
         (
             {
@@ -251,6 +268,18 @@ def test_handle_message_stop():
 def test_extract_usage_metrics():
     event = {
         "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0},
+        "metrics": {"latencyMs": 0},
+    }
+
+    tru_usage, tru_metrics = strands.event_loop.streaming.extract_usage_metrics(event)
+    exp_usage, exp_metrics = event["usage"], event["metrics"]
+
+    assert tru_usage == exp_usage and tru_metrics == exp_metrics
+
+
+def test_extract_usage_metrics_with_cache_tokens():
+    event = {
+        "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0, "cacheReadInputTokens": 0},
         "metrics": {"latencyMs": 0},
     }
 
@@ -528,8 +557,7 @@ def test_extract_usage_metrics():
 )
 @pytest.mark.asyncio
 async def test_process_stream(response, exp_events, agenerator, alist):
-    messages = [{"role": "user", "content": [{"text": "Some input!"}]}]
-    stream = strands.event_loop.streaming.process_stream(agenerator(response), messages)
+    stream = strands.event_loop.streaming.process_stream(agenerator(response))
 
     tru_events = await alist(stream)
     assert tru_events == exp_events
@@ -538,7 +566,7 @@ async def test_process_stream(response, exp_events, agenerator, alist):
 @pytest.mark.asyncio
 async def test_stream_messages(agenerator, alist):
     mock_model = unittest.mock.MagicMock()
-    mock_model.converse.return_value = agenerator(
+    mock_model.stream.return_value = agenerator(
         [
             {"contentBlockDelta": {"delta": {"text": "test"}}},
             {"contentBlockStop": {}},
@@ -549,7 +577,7 @@ async def test_stream_messages(agenerator, alist):
         mock_model,
         system_prompt="test prompt",
         messages=[{"role": "assistant", "content": [{"text": "a"}, {"text": " \n"}]}],
-        tool_config=None,
+        tool_specs=None,
     )
 
     tru_events = await alist(stream)
@@ -591,7 +619,7 @@ async def test_stream_messages(agenerator, alist):
     ]
     assert tru_events == exp_events
 
-    mock_model.converse.assert_called_with(
+    mock_model.stream.assert_called_with(
         [{"role": "assistant", "content": [{"text": "a"}, {"text": "[blank text]"}]}],
         None,
         "test prompt",
